@@ -163,6 +163,8 @@ openclaw/
 
 ### 5.2 Full docker-compose.yml
 
+> ⚠️ **Pin image versions in production.** Replace `:latest` tags with explicit versions (e.g., `langfuse/langfuse:2.x.y`, `grafana/grafana:10.x.y`). Add Dependabot to auto-PR version bumps. Using `:latest` in production causes silent breakage on compose pull.
+
 ```yaml
 # docker-compose.yml
 version: "3.9"
@@ -194,6 +196,8 @@ volumes:
   grafana_data:
   langfuse_data:
   prefect_data:
+  caddy_data:
+  caddy_certs:
 
 services:
   # ──────────────────────────────────────────
@@ -208,7 +212,6 @@ services:
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
-      - caddy_certs:/etc/caddy/certs
     networks:
       - openclaw
     healthcheck:
@@ -239,6 +242,10 @@ services:
         condition: service_healthy
       mcp-guardrails:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -260,6 +267,10 @@ services:
         condition: service_healthy
       mcp-memory:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -275,6 +286,10 @@ services:
     environment:
       <<: *common-env
       MCP_PORT: 8001
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -288,6 +303,10 @@ services:
       <<: *common-env
       MCP_PORT: 8002
       VECTOR_DIMENSIONS: 1536
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -300,6 +319,10 @@ services:
     environment:
       <<: *common-env
       MCP_PORT: 8003
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -334,6 +357,10 @@ services:
       MCP_PORT: 8005
       DISCORD_WEBHOOK_URL: ${HITL_DISCORD_WEBHOOK_URL}
       APPROVAL_TIMEOUT_SECONDS: 300
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -343,15 +370,23 @@ services:
   mcp-exec:
     image: ghcr.io/your-org/mcp-exec:${IMAGE_TAG:-latest}
     <<: *restart
+    runtime: runsc   # gVisor — must be installed on host (see provision script)
     environment:
       <<: *common-env
       MCP_PORT: 8006
       SANDBOX_ENABLED: "true"
-      # Execution sandboxed via gVisor at container level
     security_opt:
       - no-new-privileges:true
+      - seccomp:./seccomp/exec-profile.json
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=512m,noexec
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     networks:
       - openclaw
     healthcheck:
@@ -364,6 +399,10 @@ services:
     environment:
       <<: *common-env
       MCP_PORT: 8007
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -378,6 +417,10 @@ services:
       MCP_PORT: 8008
       GITHUB_APP_ID: ${GITHUB_APP_ID}
       GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY}
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -398,6 +441,10 @@ services:
       LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
     volumes:
       - langfuse_data:/app/.next/cache
+    deploy:
+      resources:
+        limits:
+          memory: 2G
     networks:
       - openclaw
     healthcheck:
@@ -415,6 +462,10 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=15d'
       - '--web.enable-lifecycle'
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
 
@@ -430,6 +481,10 @@ services:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     networks:
       - openclaw
 
@@ -445,6 +500,10 @@ services:
       PREFECT_SERVER_API_HOST: 0.0.0.0
     volumes:
       - prefect_data:/root/.prefect
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
     healthcheck:
@@ -463,6 +522,10 @@ services:
     depends_on:
       prefect-server:
         condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     networks:
       - openclaw
 ```
@@ -519,6 +582,26 @@ prefect.{$BASE_DOMAIN} {
 }
 ```
 
+### 5.4 gVisor Installation (mcp-exec Prerequisite)
+
+`mcp-exec` runs AI-generated code and requires gVisor (`runsc`) as the container runtime. Add this to the provision script before starting Docker Compose:
+
+```bash
+# Install gVisor (runsc) for sandboxed code execution
+curl -fsSL https://gvisor.dev/archive.key | sudo gpg --dearmor -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list
+sudo apt-get update && sudo apt-get install -y runsc
+
+# Register runsc as a Docker runtime
+sudo runsc install
+sudo systemctl restart docker
+
+# Verify
+docker run --runtime=runsc hello-world
+```
+
+Also create `./seccomp/exec-profile.json` with a restrictive syscall allowlist. Use Docker's default seccomp profile as a baseline and additionally block: `ptrace`, `process_vm_readv`, `process_vm_writev`, `perf_event_open`.
+
 ---
 
 ## 6. asyncio Background Task Pattern (Replacing Celery)
@@ -530,7 +613,7 @@ For MVP, long-running AI tasks are handled via asyncio without a separate worker
 import asyncio
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Callable, Coroutine
 from langfuse import Langfuse
@@ -538,6 +621,8 @@ import uuid
 
 logger = logging.getLogger(__name__)
 langfuse = Langfuse()
+
+TASK_TTL = timedelta(hours=2)  # evict completed/failed tasks after 2h
 
 
 class TaskStatus(Enum):
@@ -550,7 +635,6 @@ class TaskStatus(Enum):
 @dataclass
 class BackgroundTask:
     task_id: str
-    coroutine: Coroutine
     correlation_id: str          # Discord message ID, API request ID, etc.
     client_id: str
     interface: str               # "nanoclaw" | "api" | "claude-code"
@@ -558,6 +642,9 @@ class BackgroundTask:
     attempt: int = 0
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = field(default_factory=datetime.utcnow)
+    done_event: asyncio.Event = field(default_factory=asyncio.Event)
+    result: Any = None
+    error: Exception | None = None
 
 
 class AsyncTaskRunner:
@@ -567,10 +654,11 @@ class AsyncTaskRunner:
     At Growth stage, swap this class for a CeleryTaskRunner with same interface.
     """
 
-    def __init__(self, max_concurrent: int = 20):
+    def __init__(self, max_concurrent: int = 20, task_ttl: timedelta = TASK_TTL):
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._tasks: dict[str, BackgroundTask] = {}
         self._running: set[asyncio.Task] = set()
+        self._task_ttl = task_ttl
 
     async def submit(
         self,
@@ -585,11 +673,8 @@ class AsyncTaskRunner:
         """Submit a task and return its task_id immediately."""
         task_id = str(uuid.uuid4())
 
-        # Wrap coroutine with retry + observability
-        coro = coro_fn(*args, **kwargs)
         bg_task = BackgroundTask(
             task_id=task_id,
-            coroutine=coro,
             correlation_id=correlation_id,
             client_id=client_id,
             interface=interface,
@@ -597,16 +682,21 @@ class AsyncTaskRunner:
         )
         self._tasks[task_id] = bg_task
 
+        # Pass coro_fn + args — do NOT create the coroutine here.
+        # _run_with_retry creates it once per attempt.
         asyncio_task = asyncio.create_task(
             self._run_with_retry(bg_task, coro_fn, args, kwargs)
         )
         self._running.add(asyncio_task)
         asyncio_task.add_done_callback(self._running.discard)
 
+        # Evict old completed/failed tasks to prevent unbounded memory growth
+        asyncio.create_task(self._evict_old_tasks())
+
         return task_id
 
     async def _run_with_retry(
-        self, bg_task: BackgroundTask, coro_fn, args, kwargs
+        self, bg_task: BackgroundTask, coro_fn: Callable, args: tuple, kwargs: dict
     ) -> Any:
         trace = langfuse.trace(
             id=bg_task.task_id,
@@ -626,28 +716,57 @@ class AsyncTaskRunner:
                 bg_task.attempt = attempt
                 span = trace.span(name=f"attempt_{attempt}")
                 try:
+                    # Coroutine created fresh each attempt — no double-invocation
                     result = await coro_fn(*args, **kwargs)
                     bg_task.status = TaskStatus.COMPLETED
+                    bg_task.result = result
+                    bg_task.done_event.set()
                     span.end(output={"status": "success"})
                     trace.update(output={"status": "completed"})
                     return result
                 except Exception as e:
                     last_error = e
-                    span.end(
-                        output={"error": str(e)},
-                        level="ERROR",
-                    )
+                    span.end(output={"error": str(e)}, level="ERROR")
                     logger.warning(
                         "Task %s attempt %d failed: %s",
                         bg_task.task_id, attempt, e,
                     )
                     if attempt < bg_task.max_retries:
-                        await asyncio.sleep(2 ** attempt)  # exponential backoff
+                        await asyncio.sleep(2 ** attempt)
 
             bg_task.status = TaskStatus.FAILED
+            bg_task.error = last_error
+            bg_task.done_event.set()
             trace.update(output={"status": "failed", "error": str(last_error)})
             logger.error("Task %s permanently failed: %s", bg_task.task_id, last_error)
             raise last_error
+
+    async def wait_for_result(self, task_id: str, timeout: float = 120.0) -> Any:
+        """
+        Await task completion using asyncio.Event — no polling loop needed.
+        Raises TimeoutError if the task does not complete within `timeout` seconds.
+        """
+        task = self._tasks.get(task_id)
+        if not task:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        try:
+            await asyncio.wait_for(task.done_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Task {task_id} did not complete within {timeout}s")
+        if task.error:
+            raise task.error
+        return task.result
+
+    async def _evict_old_tasks(self) -> None:
+        """Remove completed/failed tasks older than TTL to prevent memory leaks."""
+        cutoff = datetime.utcnow() - self._task_ttl
+        to_delete = [
+            tid for tid, t in self._tasks.items()
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.FAILED)
+            and t.created_at < cutoff
+        ]
+        for tid in to_delete:
+            del self._tasks[tid]
 
     def get_status(self, task_id: str) -> TaskStatus | None:
         task = self._tasks.get(task_id)
@@ -695,18 +814,14 @@ async def handle_complex_task(discord_message, client_id: str):
     )
 
 async def _post_result_when_ready(task_id: str, discord_message):
-    """Poll task status and reply when done."""
-    for _ in range(120):  # max 120 × 1s = 2 minutes
-        status = task_runner.get_status(task_id)
-        if status and status.value in ("completed", "failed"):
-            # Result is stored in Redis by the agent
-            result = await redis.get(f"task_result:{task_id}")
-            if result:
-                await discord_message.reply(result.decode())
-            return
-        await asyncio.sleep(1)
-
-    await discord_message.reply("⚠️ Task timed out. Please try again.")
+    """Wait for task completion using asyncio.Event — no polling loop."""
+    try:
+        result = await task_runner.wait_for_result(task_id, timeout=120.0)
+        await discord_message.reply(str(result))
+    except TimeoutError:
+        await discord_message.reply("⚠️ Task timed out. Please try again.")
+    except Exception as e:
+        await discord_message.reply(f"⚠️ Task failed: {e}")
 ```
 
 ---
@@ -795,27 +910,37 @@ jobs:
             git fetch origin main
             git checkout origin/main -- docker-compose.yml Caddyfile prometheus/ grafana/
 
-            # Update image tag and pull new images
+            # Store previous image tag for rollback
+            PREVIOUS_TAG=$(docker inspect --format='{{index .Config.Labels "org.opencontainers.image.revision"}}' $(docker compose ps -q openclaw-api) 2>/dev/null || echo "")
+
+            # Pull and deploy new images
             export IMAGE_TAG=${{ env.IMAGE_TAG }}
             docker compose pull
-
-            # Rolling restart: stop old, start new
-            # ~5s downtime per service (acceptable for MVP)
             docker compose up -d --remove-orphans
 
-            # Verify health
+            # Verify health — rollback if unhealthy
             sleep 15
-            docker compose ps --format json | python3 -c "
+            UNHEALTHY=$(docker compose ps --format json | python3 -c "
             import sys, json
-            services = [json.loads(l) for l in sys.stdin]
+            services = [json.loads(l) for l in sys.stdin if l.strip()]
             unhealthy = [s['Name'] for s in services if s.get('Health') == 'unhealthy']
-            if unhealthy:
-                print(f'UNHEALTHY: {unhealthy}')
-                sys.exit(1)
-            print('All services healthy')
-            "
+            print(','.join(unhealthy))
+            ")
 
-            # Prune old images (keep last 3)
+            if [ -n "$UNHEALTHY" ]; then
+              echo "::error::Unhealthy services: $UNHEALTHY — rolling back to $PREVIOUS_TAG"
+              if [ -n "$PREVIOUS_TAG" ]; then
+                export IMAGE_TAG=$PREVIOUS_TAG
+                docker compose pull
+                docker compose up -d --remove-orphans
+                echo "Rollback complete to $PREVIOUS_TAG"
+              else
+                echo "::warning::No previous tag found — manual intervention required"
+              fi
+              exit 1
+            fi
+
+            echo "All services healthy — deploy successful"
             docker image prune -f --filter "until=72h"
 
   notify:
@@ -948,6 +1073,8 @@ MODAL_TOKEN_ID=...
 MODAL_TOKEN_SECRET=...
 ```
 
+> ⚠️ **Security Note:** The `.env` file on the Droplet is the single blast radius for full platform compromise. Protect it with: `chmod 600 /opt/openclaw/.env`. Before onboarding your first paying client, migrate to DigitalOcean Secrets Manager or HashiCorp Vault. The `GITHUB_APP_PRIVATE_KEY` value must be base64-encoded (single line) to avoid silent YAML parsing failures — store the raw PEM in Vault and inject as base64 at runtime.
+
 ### Secret Rotation Procedure
 
 ```bash
@@ -998,7 +1125,8 @@ Key metrics to alert on (same as full architecture):
 - `langfuse_task_latency_p95 > 30s` → page on-call
 - `openclaw_guardrail_blocks_total` rate spike → security review
 - `openclaw_concurrent_tasks > 15` → approaching asyncio limit
-- `container_memory_usage_bytes > 14G` → Droplet approaching OOM
+- `container_memory_usage_bytes > 12G` → Droplet approaching OOM (75% of 16GB)
+- `container_memory_usage_bytes{name="mcp-guardrails"} > 3.5G` → restart container
 
 ---
 
@@ -1267,6 +1395,65 @@ curl https://api.YOUR_DOMAIN/health
 ```
 
 **Estimated time to first deploy:** ~4 hours including DNS propagation.
+
+---
+
+## 18. Operational Runbook
+
+### Diagnosing a Down Service at 2am
+
+```bash
+# 1. Check what's running
+ssh deploy@DROPLET_IP "docker compose ps"
+
+# 2. Check logs for a specific service
+ssh deploy@DROPLET_IP "docker compose logs --tail=100 openclaw-api"
+ssh deploy@DROPLET_IP "docker compose logs --tail=100 mcp-guardrails"
+
+# 3. Check for OOM kills (most common cause)
+ssh deploy@DROPLET_IP "dmesg | grep -i 'oom\|killed' | tail -20"
+
+# 4. Check overall system resources
+ssh deploy@DROPLET_IP "free -h && df -h && docker stats --no-stream"
+```
+
+### Emergency Rollback
+
+```bash
+# Option A: Roll back to specific image tag
+ssh deploy@DROPLET_IP "cd /opt/openclaw && IMAGE_TAG=<previous-sha> docker compose pull && IMAGE_TAG=<previous-sha> docker compose up -d"
+
+# Option B: Roll back via Droplet snapshot (full system restore, ~5 min)
+# 1. Go to DigitalOcean console → Droplets → your-droplet → Snapshots
+# 2. Click "Restore" on the last known-good snapshot
+# Note: managed PostgreSQL + Redis are HA and unaffected by Droplet restore
+```
+
+### Restart a Single Service
+
+```bash
+ssh deploy@DROPLET_IP "cd /opt/openclaw && docker compose restart mcp-guardrails"
+```
+
+### Force-Recreate After Config Change
+
+```bash
+ssh deploy@DROPLET_IP "cd /opt/openclaw && docker compose up -d --force-recreate openclaw-api"
+```
+
+### Database Connection Issues
+
+```bash
+# Test DB connectivity from within the API container
+ssh deploy@DROPLET_IP "docker compose exec openclaw-api python -c \"import asyncpg; import asyncio; asyncio.run(asyncpg.connect('$DATABASE_URL'))\""
+```
+
+### Finding the Root Cause in Langfuse
+
+All LLM calls are traced. Navigate to `https://langfuse.YOUR_DOMAIN` to:
+- Find the failing trace by `task_id` or `correlation_id`
+- Identify which MCP server or agent step failed
+- Check guardrail block rates for unexpected spikes
 
 ---
 
