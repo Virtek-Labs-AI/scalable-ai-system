@@ -1,6 +1,6 @@
 # End-to-End System Design
 
-This document brings together all the research from the previous five sections into a concrete, actionable system design. It covers the recommended architecture, technology stack, implementation roadmap, and decision frameworks for building Virtek Labs' scalable autonomous AI system.
+This document establishes the system vision, architecture principles, and technology foundations for the OpenClaw platform. For the full authoritative architecture — including implementation roadmap, all 8 layers, MCP-first design, AI Agency Platform, and Claude Code CLI integration — see [doc 08: Unified Platform Architecture](08-unified-platform-architecture.md).
 
 ---
 
@@ -9,7 +9,7 @@ This document brings together all the research from the previous five sections i
 1. [System Vision & Goals](#1-system-vision--goals)
 2. [Full Architecture Diagram](#2-full-architecture-diagram)
 3. [Component Breakdown](#3-component-breakdown)
-4. [Technology Stack by Maturity Level](#4-technology-stack-by-maturity-level)
+4. [Technology Stack](#4-technology-stack)
 5. [Shared Context Registry Design](#5-shared-context-registry-design)
 6. [Parallel Agent Execution Design](#6-parallel-agent-execution-design)
 7. [Self-Optimization Loop Design](#7-self-optimization-loop-design)
@@ -25,10 +25,11 @@ This document brings together all the research from the previous five sections i
 The system being designed here is a **platform**, not just a single AI application. It is designed to:
 
 1. **Grow skills once, apply everywhere:** A skill defined once (e.g., "Security Code Review") is immediately available to any agent in any project without per-project maintenance.
-2. **Scale horizontally:** Adding new projects, agents, or tasks should require zero changes to the core infrastructure.
+2. **Scale horizontally:** Adding new projects, agents, or tasks requires zero changes to the core infrastructure.
 3. **Improve autonomously:** The system monitors its own performance and iterates on prompts, skills, and agent configurations without requiring human intervention for every improvement.
 4. **Stay safe:** Every agent operates within defined boundaries with layered guardrails, sandboxed execution, and human oversight available at all levels.
-5. **Be observable:** Every agent action, decision, and output is traced, scored, and stored for analysis.
+5. **Be observable:** Every agent action, decision, and output is traced, scored, and stored for analysis. Observability is live from Week 1.
+6. **Be interface-agnostic:** The same context and capabilities are available whether accessed via Discord (NanoClaw), the Claude Code CLI, or REST API.
 
 ---
 
@@ -36,66 +37,60 @@ The system being designed here is a **platform**, not just a single AI applicati
 
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
-│                         EXTERNAL INTERFACE                              │
-│   ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│   │  Dashboard  │  │  REST / WS   │  │  MCP Client  │             │
-│   │  (Dify/     │  │  API (FastAPI)│  │  (IDE / Bot)│             │
-│   │  Appsmith)  │  └─────────────┘  └─────────────┘             │
-│   └─────────────┘                                                   │
+│                         INTERFACE LAYER                                │
+│   ┌─────────────┐  ┌─────────────┐  ┌──────────────────────────┐    │
+│   │  NanoClaw   │  │  REST / WS   │  │  Claude Code CLI         │    │
+│   │  (Discord)  │  │  API (FastAPI)│  │  (local dev access)     │    │
+│   │  Task Bridge│  └─────────────┘  │  connects via MCP servers │    │
+│   └─────────────┘                   └──────────────────────────┘    │
 └───────────────────────────────┬───────────────────────────────────────┘
                                │
                   ┌─────────▼─────────┐
-                  │  PERIMETER LAYER      │
-                  │  LiteLLM Proxy        │
-                  │  Rate Limiting        │
-                  │  Lakera Guard         │
+                  │   PERIMETER LAYER  │
+                  │   LiteLLM Proxy    │
+                  │   Rate Limiting    │
+                  │   Budget Manager   │
                   └─────────┬─────────┘
                                │
 ┌─────────────────────────────▼───────────────────────────────────┐
 │                    ORCHESTRATION LAYER                              │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │ SUPERVISOR AGENT (LangGraph)                                  │  │
-│  │ • Receives tasks, plans decomposition                         │  │
-│  │ • Routes to specialist agents                                 │  │
-│  │ • Aggregates and synthesizes results                          │  │
+│  │ SUPERVISOR AGENT (Claude Code SDK + LangGraph)               │  │
+│  │ • Receives tasks, plans decomposition                        │  │
+│  │ • Routes to specialist agents via asyncio WorkerPool         │  │
+│  │ • Aggregates and synthesizes results                         │  │
 │  └──────────────────────────────────────────────────────────────┘  │
-│           │ Delegate via MCP / A2A Protocol                          │
-│  ┌────────────▼─────────────┐  ┌───────────────────┐  ┌────────────┐  │
-│  │ SPECIALIST AGENTS  │  │  OPTIMIZER AGENT     │  │ EVALUATOR │  │
-│  │ (Ray Actors)       │  │  (DSPy / ADAS)       │  │ AGENT     │  │
-│  │ • Research Agent   │  │  • Prompt optimizer   │  │ (RAGAS /  │  │
-│  │ • Code Agent       │  │  • Skill evolver      │  │  DeepEval) │  │
-│  │ • Analysis Agent   │  │  • Architecture search│  └────────────┘  │
-│  └────────────────────┘  └───────────────────┘                    │
+│           │ via asyncio WorkerPool (I/O-bound; no Ray needed)        │
+│  ┌────────▼─────────┐  ┌───────────────────┐  ┌───────────────┐  │
+│  │ SPECIALIST AGENTS │  │  OPTIMIZER AGENT   │  │  EVALUATOR   │  │
+│  │ Code / Research   │  │  (DSPy on Modal)   │  │  (DeepEval + │  │
+│  │ Review / Architect│  │  Nightly via Prefect│  │   RAGAS)    │  │
+│  └──────────────────┘  └───────────────────┘  └───────────────┘  │
 └────────────────────────────────┬───────────────────────────────────┘
                                │
 ┌─────────────────────────────▼───────────────────────────────────┐
-│                    SHARED CONTEXT & MEMORY                          │
+│               SHARED CONTEXT & MEMORY (MCP Servers)                │
 │  ┌─────────────────┐ ┌────────────────┐ ┌────────────────┐ │
-│  │ SKILLS REGISTRY   │ │ EPISODIC MEMORY  │ │ KNOWLEDGE RAG   │ │
-│  │ (Directus + MCP)  │ │ (Mem0 / Letta)   │ │ (Qdrant +        │ │
-│  │ Skills, Contexts, │ │ Per-user/session │ │  GraphRAG)        │ │
-│  │ Best Practices    │ │ memories         │ │ Domain knowledge │ │
+│  │  mcp-context     │ │   mcp-memory   │ │   mcp-skills   │ │
+│  │  Skills Registry │ │  PostgreSQL +  │ │  Versioning +  │ │
+│  │  Client Context  │ │  pgvector      │ │  Conflict Res. │ │
+│  │  4-Tier Model    │ │  Graphiti      │ │                │ │
 │  └─────────────────┘ └────────────────┘ └────────────────┘ │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │ TEMPORAL GRAPH (Graphiti / Zep)                            │  │
-│  │ Evolving relationships, historical context, entity graph  │  │
-│  └──────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Qdrant — per-client namespaced semantic vector search   │  │
+│  └──────────────────────────────────────────────────────────┘  │
 └────────────────────────────────┬───────────────────────────────────┘
                                │
 ┌─────────────────────────────▼───────────────────────────────────┐
 │                    GUARDRAILS LAYER                                 │
-│  Input: LLM Guard • NeMo Rails • Llama Guard                      │
-│  Exec:  Sandbox (E2B) • HITL Gates • Circuit Breakers             │
-│  Output: Guardrails AI • RAGAS Faithfulness • Hallucination Check  │
+│  Presidio (PII) → LLM Guard (injection) → Llama Guard 3 (safety) │
+│  E2B Sandbox • HITL Gates • Circuit Breakers • Trust Level Tags  │
 └────────────────────────────────┬───────────────────────────────────┘
                                │
 ┌─────────────────────────────▼───────────────────────────────────┐
-│                    OBSERVABILITY LAYER                              │
-│  Traces: Langfuse • AgentOps • OpenTelemetry Collector             │
-│  Metrics: Prometheus • Grafana • LiteLLM Dashboards               │
-│  Evals:  RAGAS nightly • DeepEval CI • Arize Phoenix drift        │
-│  Alerts: Slack • PagerDuty • Grafana Alerting                     │
+│                    OBSERVABILITY LAYER (live from Week 1)          │
+│  Langfuse (traces + evals) • Prometheus • Grafana                 │
+│  Correlation IDs end-to-end • Per-client cost attribution         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -104,212 +99,158 @@ The system being designed here is a **platform**, not just a single AI applicati
 ## 3. Component Breakdown
 
 ### A. Supervisor Agent
-- **Framework:** LangGraph (stateful graph with supervisor node)
+- **Framework:** Claude Code Agent SDK + LangGraph (stateful graph with supervisor node)
+- **Billing:** Flat-rate subscription (~$200/month/seat) — complex tasks have no per-token cost
 - **Responsibilities:** Task planning, agent routing, result aggregation, final output synthesis
-- **Model:** Claude Sonnet 3.5 or GPT-4o (high reasoning, low latency at reasonable cost)
 - **State:** Persisted in PostgreSQL via LangGraph's checkpoint system
 
-### B. Specialist Agents (Ray Actor Pool)
-- **Framework:** Ray Actors (each agent is a stateful actor)
-- **Types:** Research, Code, Analysis, Writing, Data, API Integration agents
-- **Model:** Task-dependent — routed via LiteLLM (cheap tasks → Haiku/Flash, complex → Sonnet/GPT-4o)
-- **Parallelism:** Ray autoscaler handles scaling specialist agents up/down based on queue depth
+### B. Specialist Agents (asyncio WorkerPool)
+- **Framework:** asyncio WorkerPool — LLM calls are I/O-bound; asyncio handles concurrency with zero ops overhead
+- **Types:** Research, Code, Analysis, Security Review, System Architect, AI Delivery agents
+- **Model routing:** Complex tasks → Claude Code SDK (subscription); simple ops → Haiku API (per-token)
+- **Why not Ray:** Ray adds operational complexity for a problem that asyncio solves natively at this scale
 
 ### C. Optimizer Agent
-- **Framework:** DSPy for prompt optimization + custom ADAS-inspired architecture search
-- **Trigger:** Runs nightly or when eval metrics drop below threshold
-- **Output:** Updated skill prompts committed to the Skills Registry
-- **Safety:** Optimizer changes go to staging environment first; promoted only after A/B eval shows improvement
+- **Framework:** DSPy MIPROv2 for prompt optimization
+- **Compute:** Modal (serverless) — bursty, infrequent runs; only pay when it runs
+- **Trigger:** Nightly via Prefect when skill eval scores trend below threshold
+- **Output:** Updated skill prompts proposed via Discord #skill-proposals channel
 
 ### D. Evaluator Agent
-- **Framework:** Custom LangGraph node + RAGAS + DeepEval
-- **Trigger:** After every agent task completion
-- **Metrics:** Faithfulness, relevance, goal achievement, latency, cost
-- **Output:** Scores stored in Langfuse; anomalies trigger alerts
+- **Framework:** DeepEval + RAGAS
+- **Trigger:** After every agent task completion (async, non-blocking)
+- **Metrics:** Goal achievement, standard compliance, completeness, correctness, efficiency
+- **Output:** Scores stored in Langfuse with correlation IDs; drives all three improvement loops
 
 ---
 
-## 4. Technology Stack by Maturity Level
+## 4. Technology Stack
 
-### Phase 1: Prototype (Weeks 1-4)
-
-| Component | Technology | Why |
-|-----------|------------|-----|
-| Agent Framework | LangGraph | Stateful, production-grade, great docs |
-| Memory | Mem0 cloud | Zero ops, instant setup |
-| Vector DB | Chroma (local) | In-process, no server needed |
-| LLM Routing | LiteLLM SDK | No proxy needed yet |
-| Observability | Langfuse cloud | Free tier, zero setup |
-| Guardrails | Guardrails AI | Simple output validation |
-| Context UI | Directus cloud | Free tier, MCP ready |
-| Deployment | Local / Docker Compose | Fast iteration |
-
-### Phase 2: Production (Months 2-4)
+### Definitive Stack (April 2026)
 
 | Component | Technology | Why |
 |-----------|------------|-----|
-| Agent Framework | LangGraph + Ray | Add parallelism |
-| Memory | Mem0 self-hosted + Graphiti | Data control, graph memory |
-| Vector DB | Qdrant self-hosted | Production performance |
-| LLM Routing | LiteLLM Proxy | Budget enforcement, routing |
-| Observability | Langfuse self-hosted + AgentOps | Full data control |
-| Guardrails | NeMo + LLM Guard + Llama Guard | Layered defense |
-| Context UI | Directus self-hosted + Appsmith | Custom admin panels |
-| Deployment | Kubernetes (GKE/EKS) | Auto-scaling |
-| CI/CD | GitHub Actions + DeepEval | Quality gates |
+| Agent Framework | Claude Code SDK + LangGraph | Subscription flat-rate for complex work; stateful checkpointing |
+| Agent Concurrency | asyncio WorkerPool | LLM calls are I/O-bound; asyncio handles this natively |
+| Task Queue | Celery + Redis | Durable retry semantics, dead letter queue, mature ecosystem |
+| Primary Database | PostgreSQL 16 | Tasks, skills, audit logs, LangGraph checkpoints, RLS isolation |
+| Episodic Memory | PostgreSQL + pgvector | Same database, no external dependency; RLS auto-enforces isolation |
+| Temporal Graph | Graphiti on PostgreSQL | Open-source; runs on existing PG instance; no Neo4j needed |
+| Vector Search | Qdrant (self-hosted) | Per-client namespaces, production performance, open source |
+| Skills Registry | Directus + PostgreSQL | MCP-native, UI for editing skills, version tracking |
+| Observability | Langfuse + Prometheus + Grafana | Deployed Week 1; traces + metrics + dashboards |
+| Guardrails | Presidio + LLM Guard + Llama Guard 3 | Layered defense; designed for Claude (unlike NeMo) |
+| Code Sandbox | E2B | Ephemeral VM per execution; no host escape possible |
+| Optimization | DSPy on Modal | Serverless compute; only pay when nightly job runs |
+| Scheduling | Prefect | Nightly DSPy, memory consolidation, weekly skill mining |
+| Admin UI | Directus + Appsmith | Skills management + HITL approval interface |
 
-### Phase 3: Enterprise (Months 5+)
+### Removed Components and Replacements
 
-| Component | Technology | Why |
-|-----------|------------|-----|
-| Agent Framework | LangGraph + Ray + Message Queue | Full async, massive scale |
-| Memory | Letta + Graphiti + pgvector | Tiered memory, SQL integration |
-| Vector DB | Qdrant cluster | Horizontal scaling |
-| LLM Routing | Kong AI Gateway + LiteLLM | Enterprise auth, compliance |
-| Observability | Datadog LLM Observability | Unified enterprise observability |
-| Guardrails | Full 5-layer stack | Defense in depth |
-| Context UI | Custom React + Directus | Full custom admin experience |
-| Deployment | Kubernetes + HPA + KEDA | Event-driven autoscaling |
-| Self-Optimization | DSPy + ADAS + Nightly eval loops | Autonomous improvement |
+| Removed | Why | Replacement |
+|---------|-----|-------------|
+| Ray | Overkill for I/O-bound LLM concurrency; adds ops burden | asyncio WorkerPool |
+| Mem0 | External dependency; RLS not automatic | PostgreSQL + pgvector |
+| Neo4j | Second graph database; ops overhead | Graphiti on PostgreSQL |
+| Zep Cloud | Vendor dependency; same capability available OSS | Graphiti on PostgreSQL |
+| NeMo Guardrails | Designed for Llama; poor Claude compatibility | Presidio + LLM Guard + Llama Guard 3 |
+| AgentOps | Redundant with Langfuse | Langfuse (covers traces + evals) |
+| Redis Streams (primary) | Custom consumer code; fragile retries | Celery + Redis |
+
+### LLM Cost Strategy: Subscription + API Hybrid
+
+| Task Category | Model | Billing |
+|---------------|-------|---------|
+| Complex: planning, code gen, research, evaluation | Claude via SDK | Flat-rate subscription |
+| Simple: parsing, classification, embedding | Claude Haiku API | Per-token (~$0.001/1K tokens) |
+| DSPy optimization | Claude Opus via SDK | Flat-rate subscription |
+| Embeddings | text-embedding-3-small | OpenAI API per-token |
 
 ---
 
 ## 5. Shared Context Registry Design
 
-The Skills Registry is the core innovation that makes skills defined once available everywhere.
+The Skills Registry is the core innovation that makes skills defined once available everywhere. See [doc 07](07-hierarchical-context-architecture.md) for the complete 4-tier context model and implementation details.
 
-### Data Model
+### Data Model (Key Tables)
 
 ```sql
--- Skills Registry (PostgreSQL via Directus)
-CREATE TABLE agent_skills (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    slug        VARCHAR(100) UNIQUE NOT NULL,  -- e.g., 'security-code-review'
-    name        VARCHAR(200) NOT NULL,
-    description TEXT,
-    version     VARCHAR(20) NOT NULL,           -- semver: '1.2.0'
-    instructions TEXT NOT NULL,                 -- Full skill prompt/instructions
-    tags        TEXT[],                          -- ['security', 'code-review']
-    frameworks  TEXT[],                          -- ['python', 'any']
-    metadata    JSONB,                           -- Arbitrary metadata
-    is_active   BOOLEAN DEFAULT true,
-    eval_score  FLOAT,                           -- Latest evaluation score
-    created_at  TIMESTAMPTZ DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ DEFAULT NOW()
-);
-
-CREATE TABLE skill_versions (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    skill_id    UUID REFERENCES agent_skills(id),
-    version     VARCHAR(20) NOT NULL,
+-- Global & Domain Skills
+CREATE TABLE skills (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    slug         VARCHAR(100) UNIQUE NOT NULL,
+    name         VARCHAR(200) NOT NULL,
+    tier         VARCHAR(20) NOT NULL CHECK (tier IN ('global', 'domain')),
+    tags         TEXT[],
     instructions TEXT NOT NULL,
-    eval_score  FLOAT,
-    promoted_by VARCHAR(100),  -- 'human' or 'optimizer-agent'
-    created_at  TIMESTAMPTZ DEFAULT NOW()
+    version      VARCHAR(20) NOT NULL DEFAULT '1.0.0',
+    eval_score   FLOAT,
+    is_active    BOOLEAN DEFAULT true,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE project_contexts (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    project_id  VARCHAR(100) NOT NULL,
-    context_key VARCHAR(100) NOT NULL,
-    context_val JSONB NOT NULL,
-    inherited_from UUID REFERENCES project_contexts(id),  -- Inheritance chain
-    UNIQUE(project_id, context_key)
+-- Client / Project Contexts (isolated by RLS)
+CREATE TABLE client_contexts (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id    VARCHAR(100) NOT NULL,
+    project_id   VARCHAR(100),
+    context_key  VARCHAR(100) NOT NULL,
+    context_val  JSONB NOT NULL,
+    UNIQUE(client_id, project_id, context_key)
 );
+
+-- Row-Level Security enforces isolation at database level
+ALTER TABLE client_contexts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY client_isolation ON client_contexts
+    USING (client_id = current_setting('app.current_client_id'));
 ```
 
 ### How Skills Flow to Agents
 
-```python
-# 1. Agent starts up and loads relevant skills from registry
-async def load_skills_for_agent(agent_type: str) -> list[Skill]:
-    # Via Directus MCP server or REST API
-    skills = await directus.get_items(
-        collection="agent_skills",
-        filter={"tags": {"_contains": agent_type}, "is_active": {"_eq": True}}
-    )
-    return skills
-
-# 2. Skills are injected into the agent's system prompt
-def build_system_prompt(base_prompt: str, skills: list[Skill]) -> str:
-    skill_section = "\n\n## Available Skills\n"
-    for skill in skills:
-        skill_section += f"### {skill.name} (v{skill.version})\n"
-        skill_section += f"{skill.instructions}\n\n"
-    return base_prompt + skill_section
-
-# 3. Any project can access skills by tag without per-project maintenance
-code_agent_skills = await load_skills_for_agent("code-review")
-# Returns: Security Review v1.2, Code Quality v2.0, Documentation v1.5
-# These are shared across ALL projects automatically
-```
+Skills are exposed via the `mcp-context` and `mcp-skills` MCP servers. Any interface — NanoClaw agents, Claude Code CLI sessions, or REST API callers — connects to the same servers and receives the same context. This is what makes the system interface-agnostic.
 
 ### Context Inheritance Pattern
 
 ```
-Global Context (organization-wide defaults)
-    └── Project Context (project-specific overrides)
-            └── Agent Context (agent-specific overrides)
-                    └── Session Context (ephemeral, per-conversation)
+Global Context (all agents, all interfaces)
+    └── Domain Context (tagged agents matching task domain)
+            └── Client Context (isolated per client, RLS-enforced)
+                    └── Task Context (ephemeral, single session)
 ```
-
-Each level inherits from the level above and can override specific keys. This allows organization-wide best practices to propagate automatically while enabling project-specific customizations.
 
 ---
 
 ## 6. Parallel Agent Execution Design
 
-### Ray Actor Pool Pattern
+### asyncio WorkerPool Pattern
 
-```python
-import ray
-from ray import serve
+The WorkerPool manages concurrency without the operational overhead of Ray. For I/O-bound LLM calls, asyncio's event loop is the correct primitive:
 
-@ray.remote
-class SpecialistAgent:
-    def __init__(self, agent_type: str, skills: list):
-        self.agent_type = agent_type
-        self.skills = skills
-        self.llm = load_litellm_client()
-        
-    async def execute_task(self, task: Task) -> TaskResult:
-        # Load agent-specific skills from registry
-        context = await load_skills_for_agent(self.agent_type)
-        # Execute with ReAct loop
-        result = await self.react_loop(task, context)
-        # Store outcome in Mem0
-        await mem0.add(result.summary, user_id=task.user_id)
-        return result
-
-# Create a pool of specialist agents
-research_pool = [SpecialistAgent.remote("research", skills) for _ in range(10)]
-code_pool = [SpecialistAgent.remote("code", skills) for _ in range(10)]
-
-# Distribute tasks across the pool in parallel
-futures = [agent.execute_task.remote(task) for agent, task in zip(research_pool, tasks)]
-results = await asyncio.gather(*[f for f in futures])
-```
+- **Concurrency limit:** Semaphore at 10 concurrent agent tasks (tunable per Claude Code seat count; ~3-5 sessions per seat)
+- **Partial failure handling:** `asyncio.gather(return_exceptions=True)` — if one context source fails (circuit breaker tripped), the task continues with the available context
+- **Structured outputs:** All agent results are typed Pydantic models (`AgentResult`, `AgentHandoff`) — no untyped dicts flowing between agents
+- **Idempotency:** Idempotency keys prevent double-execution on Celery retries
 
 ### Task Queue Architecture
 
 ```
-User Request
+User Request (Discord / CLI / API)
     │
     ▼
-Supervisor Agent ───► Task Decomposition
-    │                       │
-    │              ┌────────▼────────┐
-    │              │  Redis Streams    │  ←── Task Queue
-    │              │  (Task Queue)     │
-    │              └───┬───┬───┬───┘
-    │                 │   │   │
-    │              ┌──▼┐ ┌▼┐ ┌▼─┐
-    │              │R│ │C│ │A │  ←── Specialist Agent Workers (Ray)
-    │              └──┘ └─┘ └──┘
-    │              Research Code Analysis
+Task Intelligence → Parsed + Budget-checked task
     │
     ▼
-Result Aggregation ─► Final Response
+Celery + Redis Task Queue (durable, retry with backoff, DLQ)
+    │
+    ▼
+Supervisor Agent (Claude Code SDK + LangGraph)
+    │
+    ▼
+asyncio WorkerPool → Specialist Agents (concurrent)
+    │
+    ▼
+Result Aggregation → Discord / CLI / API Response
 ```
 
 ---
@@ -317,153 +258,90 @@ Result Aggregation ─► Final Response
 ## 7. Self-Optimization Loop Design
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                   NIGHTLY OPTIMIZATION CYCLE                        │
-│                                                                      │
-│  1. COLLECT EVAL DATA                                                │
-│     Langfuse → gather last 24h of traces with scores                │
-│     Filter: skills with eval_score < 0.80 threshold                  │
-│                          │                                          │
-│  2. IDENTIFY IMPROVEMENT TARGETS                                     │
-│     Optimizer Agent analyzes low-scoring skill/prompt pairs          │
-│     Clusters failure modes from trace metadata                       │
-│                          │                                          │
-│  3. GENERATE CANDIDATES (DSPy)                                       │
-│     DSPy MIPROv2 generates 5-10 improved prompt variants            │
-│     Each variant is tested against evaluation dataset               │
-│                          │                                          │
-│  4. EVALUATE CANDIDATES                                              │
-│     RAGAS scores each variant on faithfulness, relevance             │
-│     DeepEval runs regression test suite                              │
-│                          │                                          │
-│  5. PROMOTE OR DISCARD                                               │
-│     If best candidate > current score + 5%: promote to staging       │
-│     If staging A/B test passes: update Skills Registry               │
-│     Human notification sent (optional HITL approval gate)           │
-│                          │                                          │
-│  6. LOG & LEARN                                                      │
-│     Store optimization history in skill_versions table              │
-│     Reflexion: store “what worked” for optimizer agent memory       │
-└────────────────────────────────────────────────────────────────┘
+NIGHTLY OPTIMIZATION CYCLE (Prefect-scheduled, Modal compute)
+
+1. COLLECT EVAL DATA
+   Langfuse → gather last 24h traces with quality scores
+   Filter: skills with eval_score < 0.80 or trending down over 7 days
+
+2. IDENTIFY TARGETS
+   Optimizer Agent analyzes low-scoring skill/prompt pairs
+   Clusters failure modes from trace metadata
+
+3. GENERATE CANDIDATES (DSPy MIPROv2 on Modal)
+   Generates 5-10 improved prompt variants per underperforming skill
+   Each variant tested against evaluation dataset
+
+4. EVALUATE CANDIDATES (DeepEval + RAGAS)
+   RAGAS scores each variant on faithfulness, relevance
+   DeepEval runs regression test suite
+
+5. PROMOTE OR DISCARD
+   If best candidate > current score + 5%: stage as canary (5% traffic)
+   Canary passes quality gates → 25% → 50% → 100%
+   Human notification sent via Discord #skill-proposals
+   Auto-rollback if metrics regress at any canary stage
+
+6. LOG & LEARN
+   Store optimization history in skill_versions table
+   Successful patterns stored in pgvector for future reference
 ```
 
 ---
 
 ## 8. Dashboard & Admin Design
 
-### Dashboard Components
+All dashboards are accessible from the start (deployed Week 1 alongside the first agent):
 
-```
-┌────────────────────────────────────────────────────────────────┐
-│  VIRTEK LABS AI PLATFORM — ADMIN DASHBOARD                          │
-├────────────────────────────────────────────────────────────────┤
-│  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │
-│  │ SKILLS MANAGER  │ │ AGENT MONITOR   │ │ COST TRACKER    │  │
-│  │ (Directus UI)   │ │ (Grafana)       │ │ (Helicone /     │  │
-│  │                 │ │                 │ │  LiteLLM)       │  │
-│  │ • Browse skills  │ │ • Active agents  │ │ • Daily spend    │  │
-│  │ • Edit contexts  │ │ • Task queue     │ │ • Per-project    │  │
-│  │ • Version history│ │ • Error rates    │ │ • Budget alerts  │  │
-│  │ • Tag management │ │ • Latency p95    │ │ • Model usage    │  │
-│  └────────────────┘ └────────────────┘ └────────────────┘  │
-│  ┌────────────────┐ ┌────────────────┐ ┌────────────────┐  │
-│  │ TRACE EXPLORER  │ │ EVAL DASHBOARD  │ │ HITL APPROVALS  │  │
-│  │ (Langfuse)      │ │ (Langfuse/RAGAS)│ │ (Appsmith)      │  │
-│  │                 │ │                 │ │                 │  │
-│  │ • Full traces   │ │ • Quality trends │ │ • Pending tasks  │  │
-│  │ • Token usage   │ │ • Skill scores   │ │ • Approve/Reject │  │
-│  │ • Debug view    │ │ • Model compare  │ │ • Action details │  │
-│  │ • Prompt history │ │ • Regressions    │ │ • Audit log      │  │
-│  └────────────────┘ └────────────────┘ └────────────────┘  │
-└────────────────────────────────────────────────────────────────┘
-```
+| Dashboard | Tool | What It Shows |
+|-----------|------|---------------|
+| **Trace Explorer** | Langfuse | Full token-level agent traces, prompt versions, quality scores |
+| **System Metrics** | Grafana + Prometheus | Active agents, queue depth, error rates, latency p95 |
+| **Cost Tracker** | Langfuse + LiteLLM | Per-client spend, model usage breakdown, budget status |
+| **Skills Manager** | Directus UI | Browse/edit skills, version history, effectiveness scores |
+| **HITL Approvals** | Discord + Appsmith | Pending decisions, approve/reject interface, audit log |
+| **Memory Browser** | Custom (Appsmith) | Client context explorer, memory contradiction alerts |
 
 ---
 
 ## 9. Implementation Roadmap
 
-### Sprint 1-2 (Weeks 1-4): Foundation
-```
-☐ Set up GitHub repository and CI/CD (GitHub Actions)
-☐ Deploy LangGraph-based Supervisor Agent
-☐ Implement 2-3 Specialist Agents (Research, Code)
-☐ Set up Directus for Skills Registry with initial skills
-☐ Connect Mem0 for agent memory
-☐ Deploy LiteLLM Proxy for model routing
-☐ Set up Langfuse for observability
-☐ Add Guardrails AI for output validation
-☐ First working end-to-end task: user → supervisor → agents → result
-```
+See [doc 08: Unified Platform Architecture — Implementation Roadmap](08-unified-platform-architecture.md#21-implementation-roadmap) for the complete 6-phase, 18-week roadmap.
 
-### Sprint 3-4 (Weeks 5-8): Parallelism & Memory
-```
-☐ Integrate Ray for parallel specialist agent execution
-☐ Add Redis Streams task queue
-☐ Deploy Qdrant for production vector search
-☐ Implement Graphiti for temporal knowledge graph
-☐ Build context inheritance system (global → project → agent → session)
-☐ Add NeMo Guardrails for dialogue control
-☐ Set up Grafana dashboards for system metrics
-☐ Deploy AgentOps for agent session replay
-```
+See [doc 10: Implementation Plan](10-implementation-plan.md) for hosting options, infrastructure sizing, and detailed cost analysis.
 
-### Sprint 5-6 (Weeks 9-12): Safety & Evaluation
-```
-☐ Implement full 5-layer guardrail stack
-☐ Deploy Llama Guard 3 for content safety
-☐ Set up RAGAS nightly evaluation pipeline
-☐ Implement DeepEval CI/CD quality gates
-☐ Add HITL approval gates for high-stakes actions
-☐ Build sandboxed code execution (E2B integration)
-☐ Run first Garak + PyRIT security assessment
-☐ Document adversarial test results and mitigations
-```
-
-### Sprint 7-8 (Weeks 13-16): Self-Optimization & Dashboard
-```
-☐ Build Optimizer Agent using DSPy
-☐ Implement nightly optimization loop
-☐ Build Appsmith admin dashboard for Skills Manager + HITL
-☐ Set up Helicone for cost tracking
-☐ Implement context versioning with rollback
-☐ A/B testing infrastructure for prompt/skill updates
-☐ Build skill promotion workflow (staging → production)
-☐ Team training on dashboard and context management
-```
-
-### Sprint 9-12 (Months 5-6): Scale & Harden
-```
-☐ Kubernetes deployment with HPA
-☐ Multi-tenant isolation (project namespaces)
-☐ Compliance audit (OWASP LLM Top 10 checklist)
-☐ Disaster recovery and backup procedures
-☐ Load testing at 10x expected volume
-☐ Documentation for new team members
-☐ Establish SLOs: p95 latency, uptime, eval score thresholds
-```
+**Phase summary:**
+- **Weeks 1-3:** Foundations — loop closes, observability live
+- **Weeks 4-6:** Memory & parallelism — multi-client, isolated, accumulating
+- **Weeks 7-9:** Safety & guardrails — production-grade trust
+- **Weeks 10-13:** Self-improvement — system gets better autonomously
+- **Weeks 14-16:** AI Agency Platform — design and deliver AI systems for clients
+- **Weeks 17-18:** Scale & harden — Kubernetes, load testing, full autonomy
 
 ---
 
 ## 10. Cost Estimation
 
-### Monthly Infrastructure Costs (Production, ~1000 tasks/day)
+### Monthly Operational Costs
 
-| Component | Tool | Estimated Cost/Month |
-|-----------|------|----------------------|
-| LLM API calls | Mixed models via LiteLLM | $500-2000 |
-| Vector Database | Qdrant Cloud (1M vectors) | $70 |
-| Memory | Mem0 Pro | $50 |
-| Observability | Langfuse cloud | $0-100 |
-| Compute (agents) | GKE 4-node cluster | $400 |
-| Context Registry | Directus cloud | $0-50 |
-| Redis (queues) | Redis Cloud | $30 |
-| **Total** | | **~$1,050-2,700/month** |
+| Category | Tool | MVP (< 5 clients) | Growth (5-15 clients) |
+|----------|------|-------------------|----------------------|
+| LLM — complex tasks | Claude Code SDK (subscription) | $400/month (2 seats) | $600/month (3 seats) |
+| LLM — simple ops | Haiku API | ~$20/month | ~$50/month |
+| Embeddings | OpenAI API | ~$10/month | ~$25/month |
+| Infrastructure | DigitalOcean (see doc 10) | ~$150-200/month | ~$350-500/month |
+| Vector DB | Qdrant (self-hosted on DO) | included in infra | included in infra |
+| Observability | Langfuse (self-hosted) | included in infra | included in infra |
+| Serverless compute | Modal (DSPy nightly) | ~$5-15/month | ~$15-30/month |
+| **Total** | | **~$585-645/month** | **~$1,040-1,205/month** |
+
+> LLM API costs drop significantly relative to Claude Code subscription as task volume grows — the subscription absorbs more and more value at flat rate.
 
 ### Cost Optimization Strategies
-1. **Semantic caching** (Portkey): reduce LLM calls by 20-40% for repeated queries
-2. **Model routing** (LiteLLM): route 60% of tasks to cheap models (Haiku, Flash), reserve GPT-4o/Sonnet for complex ones
-3. **Self-hosted stack**: Replace cloud services with self-hosted to cut recurring costs by 40-60%
-4. **Batch processing**: Run non-urgent agent tasks in batch mode during off-peak hours at lower API cost
+1. **Subscription maximization:** Route every feasible complex task through Claude Code SDK — the more you use it, the better the $/task ratio
+2. **Semantic caching (Redis):** Cache identical or near-identical task results — reduces API calls 20-40%
+3. **Self-hosted stack:** All key services run self-hosted on DigitalOcean — no per-seat SaaS fees
+4. **Haiku for all simple ops:** Classification, parsing, extraction never touch the expensive models
 
 ---
 
@@ -473,29 +351,28 @@ Result Aggregation ─► Final Response
 
 | Risk Level | Action Type | Decision |
 |------------|-------------|----------|
-| Critical | Irreversible (delete data, deploy to prod, send external communications) | Always require human approval |
-| High | Semi-reversible (write to production DB, external API writes) | Require approval for first N executions, then auto-approve if consistent |
-| Medium | Easily reversible (draft creation, internal data writes) | Auto-execute with human notification |
+| Critical | Irreversible (delete data, deploy to prod, external client comms, AI system delivery) | Always require human approval |
+| High | Semi-reversible (write to production DB, external API writes) | Require approval for first N, then auto with monitoring |
+| Medium | Easily reversible (draft content, internal writes) | Auto-execute with human notification |
 | Low | Read-only, ephemeral | Auto-execute silently |
 
-### When to Scale Out vs. Scale Up
-
-| Situation | Strategy |
-|-----------|----------|
-| Many parallel independent tasks | Scale out (more agent workers, Ray pool) |
-| Single complex multi-step task | Scale up (bigger context window, better model) |
-| Repeated similar queries | Semantic caching (reduce scale entirely) |
-| Unpredictable burst traffic | Serverless (Modal, AWS Lambda for agent execution) |
-
-### When to Upgrade Memory Architecture
+### When to Add More Claude Code Seats
 
 | Signal | Action |
 |--------|--------|
-| Context window limits hit regularly | Upgrade to Letta for infinite memory |
-| Relationships between entities matter | Add Graphiti knowledge graph |
-| Cross-session personalization needed | Add Mem0 for user-level memory |
-| Domain knowledge frequently outdated | Implement agentic RAG with refresh triggers |
+| Queue depth consistently > 10 tasks | Add another Claude Code seat (+$200/month) |
+| Agent session wait time > 30 seconds | Add another seat |
+| Peak concurrency hitting semaphore limit | Add seat + increase WorkerPool limit |
+
+### When to Upgrade Infrastructure
+
+| Signal | Action |
+|--------|--------|
+| PostgreSQL query p95 > 100ms | Upgrade to next DO managed DB tier |
+| Qdrant search p95 > 500ms | Add RAM to Qdrant droplet |
+| Celery worker backlog growing | Add worker replicas (scale horizontally) |
+| Redis memory > 70% | Upgrade Redis plan |
 
 ---
 
-*Last updated: April 2026 | [← GitHub Resources](05-github-resources.md) | [↑ Back to README](../README.md)*
+*Last updated: April 2026 | [← GitHub Resources](05-github-resources.md) | [Unified Architecture →](08-unified-platform-architecture.md) | [↑ Back to README](../README.md)*
