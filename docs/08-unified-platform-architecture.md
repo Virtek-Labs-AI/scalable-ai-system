@@ -843,6 +843,65 @@ class HITLManager:
             raise HITLTimeoutError(f"No response within timeout for task {task_id}")
 ```
 
+#### HITL Durability and Discord-Outage Recovery
+
+HITL approval state must be persisted to PostgreSQL before delivery — never held only in an asyncio future. A Discord outage must not silently lose pending approvals.
+
+```sql
+CREATE TABLE hitl_approvals (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id         UUID NOT NULL REFERENCES tasks(id),
+    client_id       UUID NOT NULL,
+    action_summary  TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+    requested_at    TIMESTAMPTZ DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    resolved_at     TIMESTAMPTZ,
+    resolved_by     TEXT,        -- Discord user ID or "api:user@email.com"
+    discord_message_id  TEXT     -- NULL if Discord delivery failed
+);
+```
+
+```python
+async def request_hitl_approval(task_id: str, action_summary: str, client_id: str) -> bool:
+    # 1. Persist FIRST — before attempting Discord delivery
+    approval_id = await db.fetch_val(
+        "INSERT INTO hitl_approvals (task_id, client_id, action_summary, expires_at) "
+        "VALUES ($1, $2, $3, NOW() + INTERVAL '5 minutes') RETURNING id",
+        task_id, client_id, action_summary
+    )
+
+    # 2. Attempt Discord delivery (best-effort)
+    try:
+        msg_id = await discord_client.send_approval_request(approval_id, action_summary)
+        await db.execute(
+            "UPDATE hitl_approvals SET discord_message_id = $1 WHERE id = $2",
+            msg_id, approval_id
+        )
+    except DiscordError:
+        # Discord is down — approval is still in DB; operator can approve via REST API
+        logger.warning("Discord delivery failed for approval %s — fallback to REST API", approval_id)
+
+    # 3. Poll DB for resolution (works regardless of Discord state)
+    for _ in range(300):  # 5 minutes
+        status = await db.fetch_val(
+            "SELECT status FROM hitl_approvals WHERE id = $1", approval_id
+        )
+        if status == 'approved':
+            return True
+        if status in ('rejected', 'expired'):
+            return False
+        await asyncio.sleep(1)
+
+    await db.execute(
+        "UPDATE hitl_approvals SET status = 'expired' WHERE id = $1", approval_id
+    )
+    return False
+```
+
+A REST API endpoint `POST /api/v1/hitl/{approval_id}/resolve` allows operators to approve/reject directly when Discord is unavailable.
+
 ### Celery Task Queue
 
 ```python
@@ -990,6 +1049,38 @@ CREATE POLICY client_isolation ON memories
 SET app.current_client_id = 'acme-corp';
 -- Now all queries on `memories` automatically filter to acme-corp only
 ```
+
+#### client_id Authentication Per Interface
+
+The multi-tenant RLS model depends entirely on `client_id` being correctly authenticated — not merely passed by the caller. Each interface enforces this differently:
+
+| Interface | client_id Source | Validation Mechanism |
+|-----------|-----------------|----------------------|
+| **NanoClaw (Discord)** | Looked up from `discord_guild_id → client_id` mapping in PostgreSQL | Guild ID is cryptographically provided by Discord; never caller-supplied |
+| **REST API** | Extracted from JWT claims | JWT signed with `API_SECRET_KEY`; `client_id` embedded at token issuance, not in request body |
+| **Claude Code CLI** | From `CLIENT_ID` env var in `~/.claude/mcp.json` | MCP server validates against a pre-issued API key scoped to that `client_id` |
+
+```python
+# REST API — client_id from JWT, never from request
+async def get_current_client(token: str = Depends(oauth2_scheme)) -> str:
+    try:
+        payload = jwt.decode(token, settings.API_SECRET_KEY, algorithms=["HS256"])
+        client_id: str = payload.get("client_id")
+        if not client_id:
+            raise HTTPException(status_code=401, detail="Missing client_id in token")
+        return client_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# PostgreSQL RLS — deny-all NULL default
+-- Every table that contains client data must have:
+ALTER TABLE client_contexts ENABLE ROW LEVEL SECURITY;
+CREATE POLICY client_isolation ON client_contexts
+    USING (client_id = current_setting('app.current_client_id')::uuid);
+-- If current_setting returns NULL (unauthenticated context), no rows are returned
+```
+
+**Critical:** Never set `app.current_client_id` from a caller-supplied header or query parameter. It must only be set from a validated JWT claim or a verified guild mapping.
 
 ### Context Loading Performance
 
@@ -1333,6 +1424,51 @@ class SkillABTester:
         return await self.analyze_results(test_id)
 ```
 
+#### Prompt Promotion Safety Gate
+
+Without a validation gate, a bad nightly optimization writes directly to production and degrades every client's experience. The promotion pipeline must be:
+
+```
+Modal DSPy Run
+    │
+    ▼
+[staging_prompts] table (not yet live)
+    │
+    ▼
+Canary Evaluation Job (Prefect, runs after DSPy)
+  - Evaluate new prompts against held-out golden set (50 examples per domain)
+  - Metrics: task_success_rate, avg_token_count, guardrail_block_rate
+    │
+    ├── All metrics within 5% of baseline? ──YES──► Promote to [active_prompts]
+    │                                                (version-keyed, old version retained)
+    └── Any metric degrades >5%?           ──NO───► Reject, alert on-call, keep current
+```
+
+```sql
+-- Prompt versioning schema
+CREATE TABLE prompt_versions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    domain      TEXT NOT NULL,
+    prompt_key  TEXT NOT NULL,
+    content     TEXT NOT NULL,
+    version     INT NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('staging', 'active', 'retired')),
+    metrics     JSONB,          -- canary evaluation results
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    promoted_at TIMESTAMPTZ,
+    UNIQUE (domain, prompt_key, version)
+);
+
+-- MCP servers always read the single 'active' version
+CREATE VIEW active_prompts AS
+    SELECT DISTINCT ON (domain, prompt_key) *
+    FROM prompt_versions
+    WHERE status = 'active'
+    ORDER BY domain, prompt_key, version DESC;
+```
+
+Rollback is instantaneous: `UPDATE prompt_versions SET status = 'retired' WHERE id = $1` demotes the bad version; the previous `active` version is immediately served.
+
 ---
 
 ## 13. Layer 7: Observability & Control
@@ -1618,6 +1754,40 @@ class BudgetCircuitBreaker:
         return CircuitBreakerResult(allow=True)
 ```
 
+#### Guardrail Tiering Strategy
+
+Running all three guardrail layers synchronously on every request creates 2–10 seconds of latency overhead on a CPU-only host — consuming the entire user-visible budget for Discord interactions. The pipeline must be tiered:
+
+| Layer | Mode | Latency | Trigger |
+|-------|------|---------|---------|
+| **Presidio** (PII/regex) | Synchronous — always | ~10ms | Every request |
+| **LLM Guard** (semantic) | Synchronous — conditional | ~200ms | Risk score > 0.3 from Presidio, or tool-use requests |
+| **Llama Guard 3** (safety) | Async audit-only | ~2–8s | Sampled 10% of traffic + any flagged by LLM Guard |
+
+```python
+async def tiered_guardrail_check(content: str, risk_hints: dict) -> GuardrailResult:
+    # Layer 1: Always run — fast regex/PII
+    presidio_result = await presidio_check(content)
+    if presidio_result.hard_block:
+        return GuardrailResult(blocked=True, reason="pii_detected", layer="presidio")
+
+    # Layer 2: Conditional — only for elevated risk or tool-use
+    if presidio_result.risk_score > 0.3 or risk_hints.get("tool_use"):
+        llm_guard_result = await llm_guard_check(content)
+        if llm_guard_result.blocked:
+            return GuardrailResult(blocked=True, reason=llm_guard_result.reason, layer="llm_guard")
+
+    # Layer 3: Async audit — fire and forget, does not block response
+    if should_sample_for_audit(content):
+        asyncio.create_task(
+            audit_with_llama_guard(content, correlation_id=risk_hints.get("task_id"))
+        )
+
+    return GuardrailResult(blocked=False)
+```
+
+This approach keeps the synchronous path under 250ms in the common case while maintaining full safety coverage via async auditing and Langfuse alerting on Llama Guard flag rates.
+
 ---
 
 ## 15. AI Agency Platform: Building AI Systems for Clients
@@ -1902,6 +2072,50 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
         )
         return [types.TextContent(type="text", text=json.dumps({"id": memory_id}))]
 ```
+
+#### MCP Transport Strategy
+
+MCP defines three transport mechanisms. This platform uses **HTTP + SSE (Server-Sent Events)** for all MCP servers, not raw stdio. This is a first-class architectural decision:
+
+| Transport | Used By | Rationale |
+|-----------|---------|-----------|
+| **HTTP + SSE** | All internal MCP servers (ports 8001–8008) | Works over standard HTTP infrastructure; compatible with Docker Compose networking, load balancers, and health checks |
+| **stdio** | Claude Code CLI connecting to local MCP proxies | Required by Claude Code's MCP client implementation for local tool invocation |
+| **stdio-over-SSE bridge** | Claude Code CLI → remote MCP servers | `@openclaw/mcp-context-client` package acts as stdio adapter, forwards to HTTP+SSE server |
+
+```
+Claude Code CLI
+    │ stdio
+    ▼
+@openclaw/mcp-context-client (npx, local)
+    │ HTTP POST + SSE
+    ▼
+mcp-context:8001 (Docker / remote)
+    │ asyncpg
+    ▼
+PostgreSQL (managed)
+```
+
+All MCP servers implement the SSE transport using the `mcp` Python SDK:
+
+```python
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+
+app = Server("mcp-context")
+transport = SseServerTransport("/messages")
+
+# Tool registrations...
+@app.call_tool()
+async def handle_tool_call(name: str, arguments: dict):
+    ...
+
+# Mount SSE transport onto HTTP app
+starlette_app = Starlette(routes=transport.routes(app))
+```
+
+This means the internal port (e.g., 8001) serves both standard HTTP health checks (`GET /health`) and the MCP SSE endpoint (`GET /sse`, `POST /messages`).
 
 ---
 
